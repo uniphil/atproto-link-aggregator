@@ -1,0 +1,18 @@
+[package]
+name = "atproto-link-aggregator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+futures-util = "0.3.31"
+rusqlite = { version = "0.32.1", features = ["bundled"] }
+serde = { version = "1.0.215", features = ["derive"] }
+serde_json = "1.0.132"
+
+[dependencies.tokio]
+version = "1.41"
+features = ["full"]
+
+[dependencies.tokio-tungstenite]
+version = "0.24"
+features = ["native-tls"]
