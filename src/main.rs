@@ -16,7 +16,7 @@ static GLOBAL_ERR_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[tokio::main]
 async fn main() {
-    let (sender, receiver) = sync_channel(200); // absolute min 40 required w/ release build on my computer (drops some in dev build @ 40)
+    let (sender, receiver) = sync_channel(300); // absolute min 40 required w/ release build on my computer (drops some in dev build @ 40)
 
     thread::spawn(move || receive(receiver));
 
@@ -62,34 +62,43 @@ fn receive(receiver: Receiver<Like>) {
     conn.pragma_update(None, "cache_size", "100000000").expect("cache bigger");
     conn.pragma_update(None, "busy_timeout", "100").expect("quick timeout");
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS like (
-            uri   TEXT NOT NULL,
-            did   TEXT NOT NULL,
-            rkey  TEXT NOT NULL
+        "CREATE TABLE IF NOT EXISTS likes (
+            uri   TEXT PRIMARY KEY,
+            likes BLOB NOT NULL  -- jsonb
         )",
         (),
-    ).expect("create table");
+    ).expect("create likes table");
     conn.execute(
-        "CREATE UNIQUE INDEX IF NOT EXISTS like_did_rkey
-            ON like (did, rkey)",
+        "CREATE TABLE IF NOT EXISTS unlikes (
+            did_rkey TEXT PRIMARY KEY,
+            unlikes  INTEGER NOT NULL DEFAULT 1 -- account for like -> unlike -> like -> unlike etc
+        )",
         (),
-    ).expect("create did + rkey index");
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS like_uri
-            ON like (uri)",
-        (),
-    ).expect("create did + rkey index");
+    ).expect("create unlikes table");
 
-    let mut insert_stmt = conn.prepare("INSERT INTO like (uri, did, rkey) VALUES (?1, ?2, ?3)").expect("prepared insert");
-    let mut del_stmt = conn.prepare("DELETE FROM like WHERE did = ?1 AND rkey = ?2").expect("prepared delete");
+    let mut add_stmt = conn.prepare(
+        "INSERT INTO likes (uri, likes) VALUES (?1, jsonb_array(?2))
+           ON CONFLICT DO UPDATE
+           SET likes = json_insert(likes, '$[#]', ?2)
+        "
+    ).expect("prepared insert");
+
+    let mut del_stmt = conn.prepare(
+        "INSERT INTO unlikes (did_rkey) VALUES (?1)
+           ON CONFLICT DO UPDATE
+           SET unlikes = unlikes + 1
+        "
+    ).expect("prepared delete");
 
     for like in receiver.iter() {
         match &like.commit {
             LikeCommit::Create { record, rkey } => {
-                insert_stmt.insert((record.subject.uri.clone(), like.did, rkey)).unwrap();
+                let did_rkey = format!("{}_{}", like.did, rkey);
+                add_stmt.insert((record.subject.uri.clone(), did_rkey)).unwrap();
             }
             LikeCommit::Delete { rkey } => {
-                del_stmt.execute((like.did, rkey)).unwrap();
+                let did_rkey = format!("{}_{}", like.did, rkey);
+                del_stmt.execute((did_rkey,)).unwrap();
             }
         }
     }

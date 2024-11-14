@@ -30,7 +30,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "atproto-ref-aggregator"
+name = "atproto-link-aggregator"
 version = "0.1.0"
 dependencies = [
  "futures-util",
