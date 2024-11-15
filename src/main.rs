@@ -176,9 +176,10 @@ fn receive(mut receiver: mpsc::Receiver<Like>, config: Config) {
 
 async fn consume(tx: mpsc::Sender<Like>) {
     println!("jetstream connecting...");
-    let (ws_stream, _) = connect_async(WS_URL).await.expect("Failed to connect");
+    let (ws_stream, res) = connect_async(WS_URL).await.expect("Failed to connect");
+    println!("jetstream connected. server replied: {:?}", res);
     let (_write, read) = ws_stream.split();
-    println!("jetstream consumer ready.");
+    println!("consuming jetstream...");
     read.for_each(|message| async {
         let js: String = message.unwrap().into_text().unwrap();
         match serde_json::from_str::<Like>(&js) {

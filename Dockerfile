@@ -15,7 +15,7 @@ RUN cargo build --release --bin atproto-link-aggregator
 
 # We do not need the Rust toolchain to run the binary!
 FROM debian:bookworm-slim AS runtime
-RUN apt-get update && apt install -y openssl
+RUN apt-get update && apt install -y openssl ca-certificates
 WORKDIR /app
 COPY --from=builder /app/target/release/atproto-link-aggregator /usr/local/bin
 ENTRYPOINT ["/usr/local/bin/atproto-link-aggregator"]
