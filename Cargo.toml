@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+axum = "0.7.7"
 futures-util = "0.3.31"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde = { version = "1.0.215", features = ["derive"] }
