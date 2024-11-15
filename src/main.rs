@@ -5,9 +5,9 @@ use std::fmt::Display;
 use std::fmt;
 use serde::Deserialize;
 use futures_util::StreamExt;
-// use tokio::io::AsyncWriteExt;
-use std::sync::mpsc::{sync_channel, Receiver};
-use std::thread;
+use tokio::runtime::Handle;
+use tokio::sync::mpsc;
+use tokio::task::spawn_blocking;
 use tokio_tungstenite::connect_async;
 
 const WS_URL: &str = "wss://jetstream1.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.like";
@@ -16,17 +16,17 @@ static GLOBAL_ERR_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 #[tokio::main]
 async fn main() {
-    let (sender, receiver) = sync_channel(300); // absolute min 40 required w/ release build on my computer (drops some in dev build @ 40)
+    let (tx, rx) = mpsc::channel(300); // absolute min 40 required w/ release build on my computer (drops some in dev build @ 40)
 
-    thread::spawn(move || receive(receiver));
+    spawn_blocking(|| { receive(rx) });
 
     let (ws_stream, _) = connect_async(WS_URL).await.expect("Failed to connect");
     let (_write, read) = ws_stream.split();
-    read.for_each( |message| async {
+    read.for_each(|message| async {
         let js: String = message.unwrap().into_text().unwrap();
         match serde_json::from_str::<Like>(&js) {
             //Ok(like) => println!("{}", like),
-            Ok(like) => match sender.try_send(like) {
+            Ok(like) => match tx.try_send(like) {
                 Ok(_) => {}
                 Err(_) => {
                     let n = GLOBAL_ERR_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -48,14 +48,7 @@ async fn main() {
     println!("Hello, world!");
 }
 
-// #[derive(Debug)]
-// struct StoredLike {
-//     uri: String,
-//     did: String,
-//     rkey: String,
-// }
-
-fn receive(receiver: Receiver<Like>) {
+fn receive(mut receiver: mpsc::Receiver<Like>) {
     let conn = Connection::open("./links.db").expect("open sqlite3 db");
     conn.pragma_update(None, "journal_mode", "WAL").expect("wal");
     conn.pragma_update(None, "synchronous", "NORMAL").expect("synchronous normal");
@@ -90,7 +83,7 @@ fn receive(receiver: Receiver<Like>) {
         "
     ).expect("prepared delete");
 
-    for like in receiver.iter() {
+    while let Some(like) = Handle::current().block_on(async { receiver.recv().await }) {
         match &like.commit {
             LikeCommit::Create { record, rkey } => {
                 let did_rkey = format!("{}_{}", like.did, rkey);
