@@ -29,7 +29,10 @@ async fn main() {
     };
 
     let (tx, rx) = mpsc::channel(300); // absolute min 40 required w/ release build on my computer (drops some in dev build @ 40)
-    spawn_blocking(|| { receive(rx) });
+    spawn_blocking({
+        let config = config.clone();
+        || { receive(rx, config) }
+    });
     let t = tokio::spawn(async move { consume(tx) });
     let consumer_join = t.await.expect("...");
     println!("Jetstream consumer started...");
@@ -49,6 +52,7 @@ async fn main() {
 }
 
 async fn serve(config: Config) {
+    println!("api starting...");
     let app = Router::new()
         .route("/", routing::get(hello))
         .route("/likes", routing::get({
@@ -57,6 +61,7 @@ async fn serve(config: Config) {
         }));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.expect("tcp works");
+    println!("api ready.");
     axum::serve(listener, app).await.expect("axum starts");
 }
 async fn hello() -> &'static str {
@@ -120,8 +125,8 @@ fn get_likes_sync(query: extract::Query<GetLikesQuery>, config: Config) -> Resul
     Ok(axum::Json(LikesSummary { total_likes, latest_dids }))
 }
 
-fn receive(mut receiver: mpsc::Receiver<Like>) {
-    let conn = Connection::open("./links.db").expect("open sqlite3 db");
+fn receive(mut receiver: mpsc::Receiver<Like>, config: Config) {
+    let conn = Connection::open(config.db_path).expect("open sqlite3 db");
     conn.pragma_update(None, "journal_mode", "WAL").expect("wal");
     conn.pragma_update(None, "synchronous", "NORMAL").expect("synchronous normal");
     conn.pragma_update(None, "cache_size", "100000000").expect("cache bigger");
@@ -153,7 +158,7 @@ fn receive(mut receiver: mpsc::Receiver<Like>) {
         "
     ).expect("prepared delete");
 
-    let mut n = 0;
+    println!("receiver ready.");
 
     while let Some(like) = receiver.blocking_recv() {
         match &like.commit {
@@ -166,17 +171,14 @@ fn receive(mut receiver: mpsc::Receiver<Like>) {
                 del_stmt.execute((did_rkey,)).unwrap();
             }
         }
-        n += 1;
-        if n > 200 {
-            println!("queued: {}", receiver.len());
-            n = 0;
-        }
     }
 }
 
 async fn consume(tx: mpsc::Sender<Like>) {
+    println!("jetstream connecting...");
     let (ws_stream, _) = connect_async(WS_URL).await.expect("Failed to connect");
     let (_write, read) = ws_stream.split();
+    println!("jetstream consumer ready.");
     read.for_each(|message| async {
         let js: String = message.unwrap().into_text().unwrap();
         match serde_json::from_str::<Like>(&js) {
