@@ -5,7 +5,6 @@ use std::fmt::Display;
 use std::fmt;
 use serde::Deserialize;
 use futures_util::StreamExt;
-use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 use tokio::task::spawn_blocking;
 use tokio_tungstenite::connect_async;
@@ -25,12 +24,10 @@ async fn main() {
     read.for_each(|message| async {
         let js: String = message.unwrap().into_text().unwrap();
         match serde_json::from_str::<Like>(&js) {
-            //Ok(like) => println!("{}", like),
-            Ok(like) => match tx.try_send(like) {
-                Ok(_) => {}
-                Err(_) => {
+            Ok(like) => {
+                if let Err(e) = tx.send(like).await {
                     let n = GLOBAL_ERR_COUNT.fetch_add(1, Ordering::Relaxed);
-                    println!("like not sent (full prob) {}", n);
+                    println!("like not sent {:?} {}", e, n);
                     if n > 100 {
                         panic!("bye");
                     }
@@ -43,7 +40,6 @@ async fn main() {
                 }
             }
         }
-        // tokio::io::stdout().write_all(&format!("{:?}",x).as_bytes()).await.unwrap();
     }).await;
     println!("Hello, world!");
 }
@@ -83,7 +79,9 @@ fn receive(mut receiver: mpsc::Receiver<Like>) {
         "
     ).expect("prepared delete");
 
-    while let Some(like) = Handle::current().block_on(async { receiver.recv().await }) {
+    let mut n = 0;
+
+    while let Some(like) = receiver.blocking_recv() {
         match &like.commit {
             LikeCommit::Create { record, rkey } => {
                 let did_rkey = format!("{}_{}", like.did, rkey);
@@ -93,6 +91,11 @@ fn receive(mut receiver: mpsc::Receiver<Like>) {
                 let did_rkey = format!("{}_{}", like.did, rkey);
                 del_stmt.execute((did_rkey,)).unwrap();
             }
+        }
+        n += 1;
+        if n > 200 {
+            println!("queued: {}", receiver.len());
+            n = 0;
         }
     }
 }
