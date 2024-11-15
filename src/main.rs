@@ -6,7 +6,6 @@ use std::fmt;
 use serde::Deserialize;
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
-use tokio::task::spawn_blocking;
 use tokio_tungstenite::connect_async;
 
 const WS_URL: &str = "wss://jetstream1.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.like";
@@ -17,31 +16,12 @@ static GLOBAL_ERR_COUNT: AtomicUsize = AtomicUsize::new(0);
 async fn main() {
     let (tx, rx) = mpsc::channel(300); // absolute min 40 required w/ release build on my computer (drops some in dev build @ 40)
 
-    spawn_blocking(|| { receive(rx) });
+    tokio::task::spawn_blocking(|| { receive(rx) });
+    let t = tokio::spawn(async move { consume(tx) });
+    let consumer_join = t.await.expect("...");
+    println!("Jetstream consumer started...");
 
-    let (ws_stream, _) = connect_async(WS_URL).await.expect("Failed to connect");
-    let (_write, read) = ws_stream.split();
-    read.for_each(|message| async {
-        let js: String = message.unwrap().into_text().unwrap();
-        match serde_json::from_str::<Like>(&js) {
-            Ok(like) => {
-                if let Err(e) = tx.send(like).await {
-                    let n = GLOBAL_ERR_COUNT.fetch_add(1, Ordering::Relaxed);
-                    println!("like not sent {:?} {}", e, n);
-                    if n > 100 {
-                        panic!("bye");
-                    }
-                }
-            }
-            Err(e) => {
-                if !js.contains("\"identity\"") &&
-                   !js.contains("\"account\"") {
-                    println!("failed on {:?} for {:?}", js, e)
-                }
-            }
-        }
-    }).await;
-    println!("Hello, world!");
+    consumer_join.await
 }
 
 fn receive(mut receiver: mpsc::Receiver<Like>) {
@@ -98,6 +78,31 @@ fn receive(mut receiver: mpsc::Receiver<Like>) {
             n = 0;
         }
     }
+}
+
+async fn consume(tx: mpsc::Sender<Like>) {
+    let (ws_stream, _) = connect_async(WS_URL).await.expect("Failed to connect");
+    let (_write, read) = ws_stream.split();
+    read.for_each(|message| async {
+        let js: String = message.unwrap().into_text().unwrap();
+        match serde_json::from_str::<Like>(&js) {
+            Ok(like) => {
+                if let Err(e) = tx.send(like).await {
+                    let n = GLOBAL_ERR_COUNT.fetch_add(1, Ordering::Relaxed);
+                    println!("like not sent {:?} {}", e, n);
+                    if n > 100 {
+                        panic!("bye");
+                    }
+                }
+            }
+            Err(e) => {
+                if !js.contains("\"identity\"") &&
+                   !js.contains("\"account\"") {
+                    println!("failed on {:?} for {:?}", js, e)
+                }
+            }
+        }
+    }).await;
 }
 
 #[derive(Debug, Deserialize)]
