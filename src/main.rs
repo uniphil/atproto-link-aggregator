@@ -1,12 +1,15 @@
+use std::ffi::OsString;
 use std::sync::atomic::Ordering;
 use std::sync::atomic::AtomicUsize;
 use rusqlite::Connection;
 use std::collections::HashSet;
+use std::env;
 use std::fmt::Display;
 use std::fmt;
 use serde::{Serialize, Deserialize};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
+use tokio::task::{spawn_blocking, block_in_place};
 use tokio_tungstenite::connect_async;
 use axum::{Json, Router, extract, http, routing};
 
@@ -14,15 +17,24 @@ const WS_URL: &str = "wss://jetstream1.us-east.bsky.network/subscribe?wantedColl
 
 static GLOBAL_ERR_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Clone)]
+struct Config {
+    db_path: OsString,
+}
+
 #[tokio::main]
 async fn main() {
+    let config = Config {
+        db_path: env::var_os("DB_PATH").unwrap_or("./links.db".into()),
+    };
+
     let (tx, rx) = mpsc::channel(300); // absolute min 40 required w/ release build on my computer (drops some in dev build @ 40)
-    tokio::task::spawn_blocking(|| { receive(rx) });
+    spawn_blocking(|| { receive(rx) });
     let t = tokio::spawn(async move { consume(tx) });
     let consumer_join = t.await.expect("...");
     println!("Jetstream consumer started...");
 
-    let t_api = tokio::spawn(async { serve() });
+    let t_api = tokio::spawn(async { serve(config) });
     let api_join = t_api.await.expect(".....");
     println!("API server started...");
 
@@ -36,10 +48,13 @@ async fn main() {
     }
 }
 
-async fn serve() {
+async fn serve(config: Config) {
     let app = Router::new()
         .route("/", routing::get(hello))
-        .route("/likes", routing::get(get_likes));
+        .route("/likes", routing::get({
+            let config = config.clone();
+            move |query| async { block_in_place(|| { get_likes_sync(query, config) }) }
+        }));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.expect("tcp works");
     axum::serve(listener, app).await.expect("axum starts");
@@ -57,11 +72,8 @@ struct LikesSummary {
     total_likes: usize,
     latest_dids: Vec<String>,
 }
-async fn get_likes(query: extract::Query<GetLikesQuery>) -> Result<Json<LikesSummary>, http::StatusCode> {
-    tokio::task::block_in_place(|| { get_likes_sync(query) }).await
-}
-async fn get_likes_sync(query: extract::Query<GetLikesQuery>) -> Result<Json<LikesSummary>, http::StatusCode> {
-    let conn = Connection::open("./links.db").expect("open sqlite3 db");
+fn get_likes_sync(query: extract::Query<GetLikesQuery>, config: Config) -> Result<Json<LikesSummary>, http::StatusCode> {
+    let conn = Connection::open(config.db_path).expect("open sqlite3 db");
     conn.pragma_update(None, "cache_size", "10000000").expect("cache a bit bigger");
     conn.pragma_update(None, "busy_timeout", "1000").expect("some timeout");
 
