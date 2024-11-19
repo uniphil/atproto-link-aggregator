@@ -1,2 +1,4 @@
 fly.toml
 .git/
+target/
+links.db*
