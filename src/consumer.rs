@@ -18,7 +18,7 @@ const WS_URLS: [&str; 4] = [
     "wss://jetstream2.us-west.bsky.network/subscribe?wantedCollections=app.bsky.feed.like",
 ];
 
-pub fn consume(db_path: OsString, write_db_cache_bytes: i64) {
+pub fn consume(db_path: OsString, write_db_cache_kb: i64) {
 
     // the core of synchronization between consuming the firehose and writing to sqlite is this channel
     // - it's sync, so memory consumption by the channel itself is bounded
@@ -31,7 +31,7 @@ pub fn consume(db_path: OsString, write_db_cache_bytes: i64) {
     let (sender, receiver) = flume::bounded(1);
 
     let jetstreamer_handle = thread::spawn(move || consume_jetstream(sender));
-    let sqlizer_handle = thread::spawn(move || persist_links(db_path, write_db_cache_bytes, receiver));
+    let sqlizer_handle = thread::spawn(move || persist_links(db_path, write_db_cache_kb, receiver));
 
     for t in [jetstreamer_handle, sqlizer_handle] {
         let _ = t.join();
@@ -134,11 +134,11 @@ fn consume_jetstream(sender: flume::Sender<Update>) {
     }
 }
 
-fn persist_links(db_path: OsString, write_db_cache_bytes: i64, receiver: flume::Receiver<Update>) {
+fn persist_links(db_path: OsString, write_db_cache_kb: i64, receiver: flume::Receiver<Update>) {
     let mut conn = Connection::open(db_path).expect("open sqlite3 db");
     conn.pragma_update(None, "journal_mode", "WAL").expect("wal");
     conn.pragma_update(None, "synchronous", "NORMAL").expect("synchronous normal");
-    conn.pragma_update(None, "cache_size", (-write_db_cache_bytes).to_string()).expect("cache bigger");
+    conn.pragma_update(None, "cache_size", (-write_db_cache_kb).to_string()).expect("cache bigger");
     conn.pragma_update(None, "busy_timeout", "100").expect("quick timeout");
     conn.execute(
         "CREATE TABLE IF NOT EXISTS likes (

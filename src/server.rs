@@ -10,7 +10,7 @@ use axum::{Json, Router, extract, http, routing};
 #[derive(Clone)]
 pub struct ApiConfig {
     pub db_path: OsString,
-    pub read_db_cache_bytes: i64,
+    pub read_db_cache_kb: i64,
 }
 
 pub async fn serve(config: ApiConfig) {
@@ -42,7 +42,7 @@ struct LikesSummary {
 }
 fn get_likes_sync(query: extract::Query<GetLikesQuery>, config: ApiConfig) -> Result<Json<LikesSummary>, http::StatusCode> {
     let conn = Connection::open(config.db_path).expect("open sqlite3 db");
-    conn.pragma_update(None, "cache_size", (-config.read_db_cache_bytes).to_string()).expect("cache a bit bigger"); // positive = *pages*, neg = bytes
+    conn.pragma_update(None, "cache_size", (-config.read_db_cache_kb).to_string()).expect("cache a bit bigger"); // positive = *pages*, neg = bytes
     conn.pragma_update(None, "busy_timeout", "1000").expect("some timeout");
 
     let mut unliked_stmt = conn.prepare("SELECT 1 FROM unlikes WHERE did_rkey = ?1").expect("prepare unlike statemtn");
