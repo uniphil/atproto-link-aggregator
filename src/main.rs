@@ -10,7 +10,7 @@ const MB_IN_KB: i64 = 2_i64.pow(10);
 fn main() {
     let db_path = env::var_os("DB_PATH").unwrap_or("./links.db".into());
     let write_db_cache_kb = 100 * MB_IN_KB;
-    let read_db_cache_kb = 10 * MB_IN_KB;
+    let read_db_cache_kb = 2 * MB_IN_KB; // default of 2MB. hopefully os page cache will make up for it.
 
     thread::spawn({
         let db_path = db_path.clone();

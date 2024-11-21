@@ -1,5 +1,6 @@
 use std::fmt;
 use std::ffi::OsString;
+use std::io::{Cursor, Read};
 use std::thread;
 use std::time;
 use std::collections::HashMap;
@@ -10,12 +11,15 @@ use flume;
 use rusqlite::Connection;
 use tungstenite;
 use tungstenite::{Message, Error as TError};
+use zstd::dict::DecoderDictionary;
+
+const JETSTREAM_ZSTD_DICTIONARY: &[u8] = include_bytes!("../zstd/dictionary");
 
 const WS_URLS: [&str; 4] = [
-    "wss://jetstream2.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.like",
-    "wss://jetstream1.us-east.bsky.network/subscribe?wantedCollections=app.bsky.feed.like",
-    "wss://jetstream1.us-west.bsky.network/subscribe?wantedCollections=app.bsky.feed.like",
-    "wss://jetstream2.us-west.bsky.network/subscribe?wantedCollections=app.bsky.feed.like",
+    "wss://jetstream2.us-east.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like",
+    "wss://jetstream1.us-east.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like",
+    "wss://jetstream1.us-west.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like",
+    "wss://jetstream2.us-west.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like",
 ];
 
 pub fn consume(db_path: OsString, write_db_cache_kb: i64) {
@@ -39,6 +43,7 @@ pub fn consume(db_path: OsString, write_db_cache_kb: i64) {
 }
 
 fn consume_jetstream(sender: flume::Sender<Update>) {
+    let dict = DecoderDictionary::copy(JETSTREAM_ZSTD_DICTIONARY);
     let mut connect_retries = 0;
     let mut update = Update::new();
     'outer: loop {
@@ -63,10 +68,10 @@ fn consume_jetstream(sender: flume::Sender<Update>) {
         };
 
         loop {
-            let s = match socket.read() {
-                Ok(Message::Text(s)) => s,
-                Ok(Message::Binary(_)) => {
-                    eprintln!("jetstream: unexpected binary message (ignoring)");
+            let b = match socket.read() {
+                Ok(Message::Binary(b)) => b,
+                Ok(Message::Text(_)) => {
+                    eprintln!("jetstream: unexpected text message, should be binary for compressed (ignoring)");
                     continue
                 }
                 Ok(Message::Close(f)) => {
@@ -107,7 +112,20 @@ fn consume_jetstream(sender: flume::Sender<Update>) {
                     continue
                 }
             };
-            // print!(",");
+            let mut cursor = Cursor::new(b);
+            let mut decoder = match zstd::stream::Decoder::with_prepared_dictionary(&mut cursor, &dict) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("jetstream: failed to decompress zstd message: {e:?}");
+                    continue
+                }
+            };
+            let mut s = String::new();
+            if let Err(e) = decoder.read_to_string(&mut s) {
+                eprintln!("jetstream: failed to decode zstd: {e:?}");
+                continue
+            };
+
             match serde_json::from_str::<Like>(&s) {
                 Ok(like) => {
                     update.add(like)
@@ -137,6 +155,7 @@ fn consume_jetstream(sender: flume::Sender<Update>) {
 fn persist_links(db_path: OsString, write_db_cache_kb: i64, receiver: flume::Receiver<Update>) {
     let mut conn = Connection::open(db_path).expect("open sqlite3 db");
     conn.pragma_update(None, "journal_mode", "WAL").expect("wal");
+    // conn.pragma_update(None, "wal_autocheckpoint", "2000").expect("let wall grow a bit more"); // default 1000 (pages)
     conn.pragma_update(None, "synchronous", "NORMAL").expect("synchronous normal");
     conn.pragma_update(None, "cache_size", (-write_db_cache_kb).to_string()).expect("cache bigger");
     conn.pragma_update(None, "busy_timeout", "100").expect("quick timeout");

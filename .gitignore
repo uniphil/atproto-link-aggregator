@@ -1,3 +1,4 @@
 /target
 links.db*
 profile.json
+.DS_Store
