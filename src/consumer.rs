@@ -1,5 +1,6 @@
-use std::fmt;
+use rusqlite::Connection;
 use std::ffi::OsString;
+use std::fmt;
 use std::io::{Cursor, Read};
 use std::thread;
 use std::time;
@@ -8,21 +9,27 @@ use std::mem;
 use serde::Deserialize;
 use serde_json;
 use flume;
-use rusqlite::Connection;
 use tungstenite;
 use tungstenite::{Message, Error as TError};
 use zstd::dict::DecoderDictionary;
+use fjall;
 
 const JETSTREAM_ZSTD_DICTIONARY: &[u8] = include_bytes!("../zstd/dictionary");
 
 const WS_URLS: [&str; 4] = [
-    "wss://jetstream2.us-east.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like",
-    "wss://jetstream1.us-east.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like",
-    "wss://jetstream1.us-west.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like",
-    "wss://jetstream2.us-west.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like",
+    "wss://jetstream2.us-east.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like&cursor=0",
+    "wss://jetstream1.us-east.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like&cursor=0",
+    "wss://jetstream1.us-west.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like&cursor=0",
+    "wss://jetstream2.us-west.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like&cursor=0",
 ];
 
-pub fn consume(db_path: OsString, write_db_cache_kb: i64) {
+pub fn consume(
+    db_path: OsString,
+    write_db_cache_kb: i64,
+    likes: fjall::TransactionalPartitionHandle,
+    unlikes: fjall::TransactionalPartitionHandle,
+    keyspace: fjall::TransactionalKeyspace
+) {
 
     // the core of synchronization between consuming the firehose and writing to sqlite is this channel
     // - it's sync, so memory consumption by the channel itself is bounded
@@ -35,7 +42,7 @@ pub fn consume(db_path: OsString, write_db_cache_kb: i64) {
     let (sender, receiver) = flume::bounded(1);
 
     let jetstreamer_handle = thread::spawn(move || consume_jetstream(sender));
-    let sqlizer_handle = thread::spawn(move || persist_links(db_path, write_db_cache_kb, receiver));
+    let sqlizer_handle = thread::spawn(move || persist_links(db_path, write_db_cache_kb, likes, unlikes, keyspace, receiver));
 
     for t in [jetstreamer_handle, sqlizer_handle] {
         let _ = t.join();
@@ -152,10 +159,17 @@ fn consume_jetstream(sender: flume::Sender<Update>) {
     }
 }
 
-fn persist_links(db_path: OsString, write_db_cache_kb: i64, receiver: flume::Receiver<Update>) {
+fn persist_links(
+    db_path: OsString,
+    write_db_cache_kb: i64, 
+    likes_part: fjall::TransactionalPartitionHandle,
+    unlikes_part: fjall::TransactionalPartitionHandle,
+    keyspace: fjall::TransactionalKeyspace,
+    receiver: flume::Receiver<Update>,
+) {
+    //////// sqlite setup (nothing to do for fjall)
     let mut conn = Connection::open(db_path).expect("open sqlite3 db");
     conn.pragma_update(None, "journal_mode", "WAL").expect("wal");
-    // conn.pragma_update(None, "wal_autocheckpoint", "2000").expect("let wall grow a bit more"); // default 1000 (pages)
     conn.pragma_update(None, "synchronous", "NORMAL").expect("synchronous normal");
     conn.pragma_update(None, "cache_size", (-write_db_cache_kb).to_string()).expect("cache bigger");
     conn.pragma_update(None, "busy_timeout", "100").expect("quick timeout");
@@ -168,16 +182,15 @@ fn persist_links(db_path: OsString, write_db_cache_kb: i64, receiver: flume::Rec
     ).expect("create likes table");
     conn.execute(
         "CREATE TABLE IF NOT EXISTS unlikes (
-            did_rkey TEXT PRIMARY KEY
+            rkey_did TEXT PRIMARY KEY
         )",
         (),
     ).expect("create unlikes table");
 
+
+
     println!("receiver ready.");
-
     for update in receiver.into_iter() {
-        // print!(".");
-
         let unlikes = update.unlikes;
         let likes = update.likes
             .into_iter()
@@ -185,6 +198,8 @@ fn persist_links(db_path: OsString, write_db_cache_kb: i64, receiver: flume::Rec
             .collect::<Vec<(String, String)>>();
 
 
+
+        ///////// sqlite
         let trans = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
             Ok(t) => t,
             Err(e) => {
@@ -201,7 +216,7 @@ fn persist_links(db_path: OsString, write_db_cache_kb: i64, receiver: flume::Rec
                 ").expect("prepare likes statement");
 
             let mut fails = None;
-            for (uri, likes) in likes {
+            for (uri, likes) in &likes {
                 if let Err(e) = add_stmt.execute((uri.clone(), likes)) {
                     (*fails.get_or_insert_with(|| (0, uri, e.to_string()))).0 += 1;
                 }
@@ -213,18 +228,56 @@ fn persist_links(db_path: OsString, write_db_cache_kb: i64, receiver: flume::Rec
 
         {
             let mut unlike_stmt = trans.prepare_cached(
-                "INSERT INTO unlikes (did_rkey) VALUES (?1)
+                "INSERT INTO unlikes (rkey_did) VALUES (?1)
                    ON CONFLICT DO NOTHING
                 ").expect("prepare unlike statement");
-            for did_rkey in unlikes {
-                if let Err(e) = unlike_stmt.execute((did_rkey.clone(),)) {
-                    eprintln!("failed to insert unlike for {did_rkey}: {e:?}");
+            for rkey_did in &unlikes {
+                if let Err(e) = unlike_stmt.execute((rkey_did.clone(),)) {
+                    eprintln!("failed to insert unlike for {rkey_did}: {e:?}");
                 }
             }
         }
 
         if let Err(e) = trans.commit() {
             eprintln!("failed to commit transaction. we will lose a batch of updates: {e:?}");
+        }
+
+
+
+
+        /////// fjall
+        {
+            let mut tx = keyspace.write_tx();
+
+            { // likes
+                let mut fails = None;
+                for (uri, likes) in likes {
+                    if let Err(e) = tx.update_fetch(&likes_part, &uri, |existing| Some(match existing {
+                        Some(existing) => {
+                            // println!("{uri}");
+                            match std::str::from_utf8(&existing) {
+                                Ok(ex) => fjall::Slice::new(format!("{ex};{likes}").as_bytes()),
+                                Err(_) => panic!("could not decode existing likers")
+                            }
+                        }
+                        None => likes.clone().into(),
+                    })) {
+                        (*fails.get_or_insert_with(|| (0, uri.clone(), e.to_string()))).0 += 1;
+                    }
+                }
+                if let Some((n, uri, err)) = fails {
+                    eprintln!("failed to insert {n} likes, including {uri} because {err}");
+                }
+            }
+
+            for rkey_did in unlikes {
+                tx.insert(&unlikes_part, rkey_did.as_bytes(), "")
+            }
+
+
+            if let Err(e) = tx.commit() {
+                eprintln!("failed to commit transaction. we will lose a batch of updates: {e:?}");
+            }
         }
     }
 
@@ -243,18 +296,32 @@ impl Update {
     fn add(&mut self, like: Like) {
         match &like.commit {
             LikeCommit::Create { record, rkey } => {
-                let did_rkey = format!("{}!{}", like.did, rkey); // ! is not allowed in at-uri or record keys
+                let rkey_did = format!("{}!{}", rkey, like.did); // ! is not allowed in at-uri or record keys
+                let uri = rev_uri(record.subject.uri.clone());
                 (*self.likes
-                    .entry(record.subject.uri.clone())
+                    .entry(uri)
                     .or_insert_with(|| Vec::new())
-                ).push(did_rkey);
+                ).push(rkey_did);
             }
             LikeCommit::Delete { rkey } => {
-                let did_rkey = format!("{}!{}", like.did, rkey);
-                self.unlikes.push(did_rkey);
+                let rkey_did = format!("{}!{}", rkey, like.did);
+                self.unlikes.push(rkey_did);
             }
         }
     }
+}
+
+
+fn rev_uri(at_uri: String) -> String {
+    let Some(unprefixed) = at_uri.strip_prefix("at://") else { return at_uri; };
+
+    let mut parts = unprefixed.split("/");
+    let Some(authority) = parts.next() else { return at_uri; };
+    let Some(collection) = parts.next() else { return at_uri; };
+    let Some(rkey) = parts.next() else { return at_uri; };
+    if parts.next().is_some() { return at_uri; }
+
+    format!("{}/{}/{}", rkey, collection, authority)
 }
 
 

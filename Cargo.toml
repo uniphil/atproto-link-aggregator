@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 axum = "0.7.7"
+fjall = "2.4.0"
 flume = { version = "0.11.1", default-features = false }
 futures-util = "0.3.31"
 rusqlite = { version = "0.32.1", features = ["bundled"] }
