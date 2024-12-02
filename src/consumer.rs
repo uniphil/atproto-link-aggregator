@@ -1,7 +1,5 @@
 use redb::ReadableTable;
 use std::sync::Arc;
-use rusqlite::Connection;
-use std::ffi::OsString;
 use std::fmt;
 use std::io::{Cursor, Read};
 use std::thread;
@@ -26,8 +24,6 @@ const WS_URLS: [&str; 4] = [
 ];
 
 pub fn consume(
-    db_path: OsString,
-    write_db_cache_kb: i64,
     db: Arc<redb::Database>,
 ) {
 
@@ -42,7 +38,7 @@ pub fn consume(
     let (sender, receiver) = flume::bounded(1);
 
     let jetstreamer_handle = thread::spawn(move || consume_jetstream(sender));
-    let sqlizer_handle = thread::spawn(move || persist_links(db_path, write_db_cache_kb, db, receiver));
+    let sqlizer_handle = thread::spawn(move || persist_links(db, receiver));
 
     for t in [jetstreamer_handle, sqlizer_handle] {
         let _ = t.join();
@@ -159,32 +155,7 @@ fn consume_jetstream(sender: flume::Sender<Update>) {
     }
 }
 
-fn persist_links(
-    db_path: OsString,
-    write_db_cache_kb: i64,
-    db: Arc<redb::Database>,
-    receiver: flume::Receiver<Update>,
-) {
-    //////// sqlite setup (nothing to do for fjall)
-    let mut conn = Connection::open(db_path).expect("open sqlite3 db");
-    conn.pragma_update(None, "journal_mode", "WAL").expect("wal");
-    conn.pragma_update(None, "synchronous", "NORMAL").expect("synchronous normal");
-    conn.pragma_update(None, "cache_size", (-write_db_cache_kb).to_string()).expect("cache bigger");
-    conn.pragma_update(None, "busy_timeout", "100").expect("quick timeout");
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS likes (
-            uri   TEXT PRIMARY KEY,
-            likes BLOB NOT NULL  -- jsonb
-        )",
-        (),
-    ).expect("create likes table");
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS unlikes (
-            rkey_did TEXT PRIMARY KEY
-        )",
-        (),
-    ).expect("create unlikes table");
-
+fn persist_links(db: Arc<redb::Database>, receiver: flume::Receiver<Update>) {
     let mut nnn = 0;
 
     println!("receiver ready.");
@@ -196,88 +167,36 @@ fn persist_links(
             .map(|(uri, likers)| (uri, likers.join(";"))) // semicolon is disallowed in both dids and rkeys
             .collect::<Vec<(String, String)>>();
 
-
-
-        ///////// sqlite
-        let trans = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("failed to start transaction. we will lose a batch of updates: {e:?}");
-                continue
-            }
-        };
-
-        { // lil scopes ensure the statement is dropped before we commit
-            let mut add_stmt = trans.prepare_cached(
-                "INSERT INTO likes (uri, likes) VALUES (?1, ?2)
-                   ON CONFLICT DO UPDATE
-                   SET likes = likes || ';' || ?2
-                ").expect("prepare likes statement");
-
-            let mut fails = None;
-            for (uri, likes) in &likes {
-                if let Err(e) = add_stmt.execute((uri.clone(), likes)) {
-                    (*fails.get_or_insert_with(|| (0, uri, e.to_string()))).0 += 1;
-                }
-            }
-            if let Some((n, uri, err)) = fails {
-                eprintln!("failed to insert {n} likes, including {uri} because {err}");
-            }
+        let mut tx = db.begin_write().unwrap();
+        if nnn & 0b11111 == 0 {
+            tx.set_durability(redb::Durability::Eventual)
+        } else {
+            tx.set_durability(redb::Durability::None);
         }
-
         {
-            let mut unlike_stmt = trans.prepare_cached(
-                "INSERT INTO unlikes (rkey_did) VALUES (?1)
-                   ON CONFLICT DO NOTHING
-                ").expect("prepare unlike statement");
-            for rkey_did in &unlikes {
-                if let Err(e) = unlike_stmt.execute((rkey_did.clone(),)) {
-                    eprintln!("failed to insert unlike for {rkey_did}: {e:?}");
-                }
+            let mut likes_table = tx.open_table(crate::LIKES).unwrap();
+            let mut unlikes_table = tx.open_table(crate::UNLIKES).unwrap();
+
+            for (uri, likes) in likes {
+                let combined = match likes_table.get(&*uri).unwrap() {
+                    Some(existing) => {
+                        let ex = existing.value();
+                        format!("{ex};{likes}")
+                    }
+                    None => likes,
+                };
+                likes_table.insert(&*uri, &*combined).unwrap();
+            }
+
+            for rkey_did in unlikes {
+                unlikes_table.insert(&*rkey_did, ()).unwrap();
             }
         }
 
-        if let Err(e) = trans.commit() {
+        if let Err(e) = tx.commit() {
             eprintln!("failed to commit transaction. we will lose a batch of updates: {e:?}");
         }
-
-
-
-
-        /////// redb
-        {
-            let mut tx = db.begin_write().unwrap();
-            if nnn & 0b11111 == 0 {
-                tx.set_durability(redb::Durability::Eventual)
-            } else {
-                tx.set_durability(redb::Durability::None);
-            }
-            {
-                let mut likes_table = tx.open_table(crate::LIKES).unwrap();
-                let mut unlikes_table = tx.open_table(crate::UNLIKES).unwrap();
-
-                for (uri, likes) in likes {
-                    let combined = match likes_table.get(&*uri).unwrap() {
-                        Some(existing) => {
-                            let ex = existing.value();
-                            format!("{ex};{likes}")
-                        }
-                        None => likes,
-                    };
-                    likes_table.insert(&*uri, &*combined).unwrap();
-                }
-
-                for rkey_did in unlikes {
-                    unlikes_table.insert(&*rkey_did, ()).unwrap();
-                }
-            }
-
-            if let Err(e) = tx.commit() {
-                eprintln!("failed to commit transaction. we will lose a batch of updates: {e:?}");
-            }
-        }
     }
-
 }
 
 #[derive(Default)]
@@ -294,9 +213,8 @@ impl Update {
         match &like.commit {
             LikeCommit::Create { record, rkey } => {
                 let rkey_did = format!("{}!{}", rkey, like.did); // ! is not allowed in at-uri or record keys
-                let uri = rev_uri(record.subject.uri.clone());
                 (*self.likes
-                    .entry(uri)
+                    .entry(record.subject.uri.clone())
                     .or_insert_with(|| Vec::new())
                 ).push(rkey_did);
             }
@@ -306,20 +224,6 @@ impl Update {
             }
         }
     }
-}
-
-
-fn rev_uri(at_uri: String) -> String {
-    at_uri
-    // let Some(unprefixed) = at_uri.strip_prefix("at://") else { return at_uri; };
-
-    // let mut parts = unprefixed.split("/");
-    // let Some(authority) = parts.next() else { return at_uri; };
-    // let Some(collection) = parts.next() else { return at_uri; };
-    // let Some(rkey) = parts.next() else { return at_uri; };
-    // if parts.next().is_some() { return at_uri; }
-
-    // format!("{}/{}/{}", rkey, collection, authority)
 }
 
 

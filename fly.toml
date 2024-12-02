@@ -14,7 +14,7 @@ primary_region = 'yyz'
   initial_size = "10gb"
 
 [env]
-  DB_PATH = "/data/links.db"
+  RDB_PATH = "/data/links.rdb"
 
 [http_service]
   internal_port = 3000
