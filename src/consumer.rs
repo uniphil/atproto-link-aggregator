@@ -1,3 +1,5 @@
+use redb::ReadableTable;
+use std::sync::Arc;
 use rusqlite::Connection;
 use std::ffi::OsString;
 use std::fmt;
@@ -12,23 +14,21 @@ use flume;
 use tungstenite;
 use tungstenite::{Message, Error as TError};
 use zstd::dict::DecoderDictionary;
-use fjall;
+use redb;
 
 const JETSTREAM_ZSTD_DICTIONARY: &[u8] = include_bytes!("../zstd/dictionary");
 
 const WS_URLS: [&str; 4] = [
-    "wss://jetstream2.us-east.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like&cursor=0",
-    "wss://jetstream1.us-east.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like&cursor=0",
-    "wss://jetstream1.us-west.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like&cursor=0",
-    "wss://jetstream2.us-west.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like&cursor=0",
+    "wss://jetstream2.us-east.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like", //&cursor=0",
+    "wss://jetstream1.us-east.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like", //&cursor=0",
+    "wss://jetstream1.us-west.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like", //&cursor=0",
+    "wss://jetstream2.us-west.bsky.network/subscribe?compress=true&wantedCollections=app.bsky.feed.like", //&cursor=0",
 ];
 
 pub fn consume(
     db_path: OsString,
     write_db_cache_kb: i64,
-    likes: fjall::TransactionalPartitionHandle,
-    unlikes: fjall::TransactionalPartitionHandle,
-    keyspace: fjall::TransactionalKeyspace
+    db: Arc<redb::Database>,
 ) {
 
     // the core of synchronization between consuming the firehose and writing to sqlite is this channel
@@ -42,7 +42,7 @@ pub fn consume(
     let (sender, receiver) = flume::bounded(1);
 
     let jetstreamer_handle = thread::spawn(move || consume_jetstream(sender));
-    let sqlizer_handle = thread::spawn(move || persist_links(db_path, write_db_cache_kb, likes, unlikes, keyspace, receiver));
+    let sqlizer_handle = thread::spawn(move || persist_links(db_path, write_db_cache_kb, db, receiver));
 
     for t in [jetstreamer_handle, sqlizer_handle] {
         let _ = t.join();
@@ -161,10 +161,8 @@ fn consume_jetstream(sender: flume::Sender<Update>) {
 
 fn persist_links(
     db_path: OsString,
-    write_db_cache_kb: i64, 
-    likes_part: fjall::TransactionalPartitionHandle,
-    unlikes_part: fjall::TransactionalPartitionHandle,
-    keyspace: fjall::TransactionalKeyspace,
+    write_db_cache_kb: i64,
+    db: Arc<redb::Database>,
     receiver: flume::Receiver<Update>,
 ) {
     //////// sqlite setup (nothing to do for fjall)
@@ -187,10 +185,11 @@ fn persist_links(
         (),
     ).expect("create unlikes table");
 
-
+    let mut nnn = 0;
 
     println!("receiver ready.");
     for update in receiver.into_iter() {
+        nnn += 1;
         let unlikes = update.unlikes;
         let likes = update.likes
             .into_iter()
@@ -245,35 +244,33 @@ fn persist_links(
 
 
 
-        /////// fjall
+        /////// redb
         {
-            let mut tx = keyspace.write_tx();
+            let mut tx = db.begin_write().unwrap();
+            if nnn & 0b11111 == 0 {
+                tx.set_durability(redb::Durability::Eventual)
+            } else {
+                tx.set_durability(redb::Durability::None);
+            }
+            {
+                let mut likes_table = tx.open_table(crate::LIKES).unwrap();
+                let mut unlikes_table = tx.open_table(crate::UNLIKES).unwrap();
 
-            { // likes
-                let mut fails = None;
                 for (uri, likes) in likes {
-                    if let Err(e) = tx.update_fetch(&likes_part, &uri, |existing| Some(match existing {
+                    let combined = match likes_table.get(&*uri).unwrap() {
                         Some(existing) => {
-                            // println!("{uri}");
-                            match std::str::from_utf8(&existing) {
-                                Ok(ex) => fjall::Slice::new(format!("{ex};{likes}").as_bytes()),
-                                Err(_) => panic!("could not decode existing likers")
-                            }
+                            let ex = existing.value();
+                            format!("{ex};{likes}")
                         }
-                        None => likes.clone().into(),
-                    })) {
-                        (*fails.get_or_insert_with(|| (0, uri.clone(), e.to_string()))).0 += 1;
-                    }
+                        None => likes,
+                    };
+                    likes_table.insert(&*uri, &*combined).unwrap();
                 }
-                if let Some((n, uri, err)) = fails {
-                    eprintln!("failed to insert {n} likes, including {uri} because {err}");
+
+                for rkey_did in unlikes {
+                    unlikes_table.insert(&*rkey_did, ()).unwrap();
                 }
             }
-
-            for rkey_did in unlikes {
-                tx.insert(&unlikes_part, rkey_did.as_bytes(), "")
-            }
-
 
             if let Err(e) = tx.commit() {
                 eprintln!("failed to commit transaction. we will lose a batch of updates: {e:?}");
@@ -313,15 +310,16 @@ impl Update {
 
 
 fn rev_uri(at_uri: String) -> String {
-    let Some(unprefixed) = at_uri.strip_prefix("at://") else { return at_uri; };
+    at_uri
+    // let Some(unprefixed) = at_uri.strip_prefix("at://") else { return at_uri; };
 
-    let mut parts = unprefixed.split("/");
-    let Some(authority) = parts.next() else { return at_uri; };
-    let Some(collection) = parts.next() else { return at_uri; };
-    let Some(rkey) = parts.next() else { return at_uri; };
-    if parts.next().is_some() { return at_uri; }
+    // let mut parts = unprefixed.split("/");
+    // let Some(authority) = parts.next() else { return at_uri; };
+    // let Some(collection) = parts.next() else { return at_uri; };
+    // let Some(rkey) = parts.next() else { return at_uri; };
+    // if parts.next().is_some() { return at_uri; }
 
-    format!("{}/{}/{}", rkey, collection, authority)
+    // format!("{}/{}/{}", rkey, collection, authority)
 }
 
 
