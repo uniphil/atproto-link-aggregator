@@ -2,3 +2,6 @@ fly.toml
 .git/
 target/
 links.db*
+links.rdb
+likes-feed*
+uris.txt

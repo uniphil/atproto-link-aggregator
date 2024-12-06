@@ -62,7 +62,6 @@ fn get_likes_sync(query: extract::Query<GetLikesQuery>, db: Arc<redb::Database>)
                 })
                 .collect(),
             Ok(None) => {
-                println!("not found: {}", query.uri);
                 vec![]
             }
             Err(e) => {
